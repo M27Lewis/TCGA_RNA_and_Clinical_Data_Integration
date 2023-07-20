@@ -1,0 +1,469 @@
+---
+title: "TCGA Clinical Data Integration with RNA-Seq for Simple Exploration of Associations"
+author: "Mike Kelly"
+date: "2023-07-19"
+output: 
+  html_document:
+    toc: true
+    toc_depth: 3
+    toc_float: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE)
+```
+
+Set up libraries 
+
+```{r, message=FALSE}
+library(DESeq2)
+library(vsn)
+library(ggplot2)
+library(statmod)
+library(pheatmap)
+library(amap)
+library(RColorBrewer)
+library(biomaRt)
+library(operator.tools)
+library(ggplot2)
+library(dplyr)
+library(stringr)
+library(forcats)
+library(pheatmap)
+library(amap)
+library(clusterProfiler)
+library(DOSE)
+library(org.Hs.eg.db)
+library(enrichplot)
+library(sigclust)
+library(sva)
+library(genefu)
+library(tidyverse)
+library(EnhancedVolcano)
+library(TCGAbiolinks)
+library(rstatix)
+library(ggpubr)
+
+```
+
+
+# Read in Data 
+
+
+### RNA-Seq and Subtype Clinical Data 
+```{r}
+#RNA Data downloaded from firehose
+TCGA_RNA_Data <- read.csv("~/Documents/BRCA_Gene_Expression/gdac.broadinstitute.org_BRCA.Merge_rnaseqv2__illuminahiseq_rnaseqv2__unc_edu__Level_3__RSEM_genes_normalized__data.Level_3.2016012800.0.0/BRCA.rnaseqv2__illuminahiseq_rnaseqv2__unc_edu__Level_3__RSEM_genes_normalized__data.data.txt", sep = "\t")
+#Subtype data 
+TCGA_ClinicalData<- PanCancerAtlas_subtypes()
+TCGA_RNA_Data[1:10,1:10]
+head(TCGA_ClinicalData)
+
+```
+
+### Additional Clinical Data 
+```{r,message=FALSE}
+#more clinical data 
+All_Clinical_Data <-GDCquery_clinic(project = "TCGA-BRCA", type = "clinical")
+
+
+
+queryBRCA <- GDCquery(
+    project = "TCGA-BRCA", 
+    data.category = "Clinical",
+    data.type = "Clinical Supplement", 
+    data.format = "BCR Biotab"
+)
+
+GDCdownload(queryBRCA)
+clinical_tab_all_BRCA <- GDCprepare(queryBRCA)
+
+```
+```{r}
+#explore data 
+glimpse(All_Clinical_Data)
+head(clinical_tab_all_BRCA)
+
+
+```
+```{r}
+#look for hormone receptor status 
+dplyr::glimpse(clinical_tab_all_BRCA$clinical_patient_brca)
+
+```
+# Reformat the Data 
+```{r}
+#reformat data 
+clinical_tab_all_BRCA$clinical_patient_brca$er_status_by_ihc[1:10]
+TNBCDF <- tibble(clinical_tab_all_BRCA$clinical_patient_brca$er_status_by_ihc)
+TNBCDF$`clinical_tab_all_BRCA$clinical_patient_brca$er_status_by_ihc` <- NULL
+TNBCDF$ERStatus <- clinical_tab_all_BRCA$clinical_patient_brca$er_status_by_ihc
+TNBCDF$PRStatus <- clinical_tab_all_BRCA$clinical_patient_brca$pr_status_by_ihc
+TNBCDF$HER2Status <- clinical_tab_all_BRCA$clinical_patient_brca$her2_status_by_ihc
+TNBCDF$smallID <- clinical_tab_all_BRCA$clinical_patient_brca$bcr_patient_barcode
+head(TNBCDF)
+
+
+
+```
+
+```{r}
+#filter subtype data for breast cancer and grab patient id and subtype 
+BRCA_Subtypeinfo<- TCGA_ClinicalData |> 
+  filter(
+    cancer.type == "BRCA") |>
+      dplyr::select(
+        c("pan.samplesID","Subtype_mRNA"))
+head(BRCA_Subtypeinfo)
+
+```
+
+```{r}
+#get the first 12 characters for TCGA identifiers as some clinical data will use this info 
+BRCA_Subtypeinfo<- BRCA_Subtypeinfo |>
+  dplyr::mutate(
+    smallID = substr(pan.samplesID,1,12),
+    matchedID = str_replace_all(pan.samplesID,"-",".")
+    )
+```
+
+```{r}
+#combine the subtype info and the hormone datasheet into one clinical dataset 
+BRCA_Subtypeinfo<- merge(BRCA_Subtypeinfo,TNBCDF, by="smallID")
+head(BRCA_Subtypeinfo)
+```
+
+## Subset RNA-Seq Data for Patients that have Clinical Data 
+```{r}
+#grab the RNA-Seq data for all patients that have clinical information 
+colnamelist<- colnames(TCGA_RNA_Data)[colnames(TCGA_RNA_Data) %in% BRCA_Subtypeinfo$matchedID]
+TCGA_Cleaned_RNA_Data <- TCGA_RNA_Data |>
+  dplyr::select(
+    c("Hybridization.REF", colnamelist) 
+  )
+TCGA_Cleaned_RNA_Data[1:10,1:10]
+
+
+```
+
+## Choose Genes of Interest and Format Data for Integration with Clinical Features Based on Patient ID
+Filter gene names for selected subset, this will with any list of gene names 
+
+```{r}
+genesofinterest <- c('RSAD2','CMPK2',"PODXL",'FGF2','ALDH1A3')
+
+#create a new variable called genename that is the SYMBOL part of the Hybrid ref column 
+TCGA_RNA_subset<-TCGA_Cleaned_RNA_Data |>
+  mutate(
+    genename = gsub("\\|.*","",TCGA_Cleaned_RNA_Data$Hybridization.REF), .before = Hybridization.REF
+  ) |>
+filter(genename %in% genesofinterest)
+
+TCGA_RNA_subset[1:5,1:10]
+
+
+```
+
+```{r}
+#change format to allow combo of clinical and genomics data down the line 
+TCGA_V2<-TCGA_RNA_subset |> 
+  pivot_longer(!c(genename,Hybridization.REF), names_to = "Patient", values_to = "Gene_Count", values_drop_na = TRUE)
+head(TCGA_V2) 
+```
+
+
+
+```{r}
+TCGAVV3 <-TCGA_V2 |> 
+  pivot_wider(names_from = genename, values_from = Gene_Count) |>
+  dplyr::group_by(Patient) 
+head(TCGAVV3)
+
+```
+
+Collapse these into susinct rows 
+```{r}
+
+#tidy
+TCGAVV4 <- TCGAVV3 |>
+  group_by(Patient) |>
+  fill(ALDH1A3:RSAD2, .direction = "updown") |>
+  select(!Hybridization.REF) |>
+  distinct()
+
+
+```
+
+```{r}
+TCGAVV5<- TCGAVV4 |>
+  mutate_at(c(genesofinterest),as.numeric)
+head(TCGAVV5)
+```
+
+
+
+Base R way of doing a similar thing  
+```{r}
+#base R
+# CMPK2 <- TCGAVV3[!is.na(TCGAVV3$CMPK2),]
+# CMPK2$RSAD2 <- NULL
+# CMPK2$Hybridization.REF <- NULL
+# RSAD2 <- TCGAVV3[!is.na(TCGAVV3$RSAD2),]
+# RSAD2$CMPK2 <- NULL
+# head(CMPK2)
+# head(RSAD2)
+```
+
+
+# Merge Clinical and Genomics Data to Allow for Analysis
+```{r}
+#Merged_df<-merge(CMPK2,RSAD2, by="Patient")
+Merged_df<-TCGAVV5
+BRCA_Subtypeinfo$Patient <- BRCA_Subtypeinfo$matchedID
+Final_Merged_DF <- merge(Merged_df,BRCA_Subtypeinfo, by="Patient")
+#Final_Merged_DF$CMPK2 <- as.numeric(Final_Merged_DF$CMPK2)
+#Final_Merged_DF$RSAD2 <- as.numeric(Final_Merged_DF$RSAD2)
+head(Final_Merged_DF)
+
+```
+# Vizualizations Looking at Subtype and a few Genes
+
+## Simple Vizualizations
+```{r}
+ggplot(
+  data = Final_Merged_DF,
+  mapping = aes(as.factor(Subtype_mRNA),as.numeric(CMPK2))
+) +
+  geom_boxplot()
+
+
+
+
+
+```
+
+
+```{r}
+ggplot(
+  data = Final_Merged_DF,
+  mapping = aes(as.factor(Subtype_mRNA),as.numeric(RSAD2))
+) +
+  geom_boxplot()
+
+
+
+
+
+```
+
+## Look for Significant Differences in Expression 
+```{r}
+aov(formula = RSAD2 ~ Subtype_mRNA, data = Final_Merged_DF)
+kruskal.test(formula = RSAD2 ~ Subtype_mRNA, data = Final_Merged_DF)
+pairwise.wilcox.test(x=Final_Merged_DF$RSAD2,g= Final_Merged_DF$Subtype_mRNA)
+```
+
+
+```{r}
+#the pariwise wilcox lets us compare each group to each other group 
+pairwise.wilcox.test(x=Final_Merged_DF$RSAD2,g= Final_Merged_DF$Subtype_mRNA)
+Final_Merged_DF |>
+  pairwise_wilcox_test(RSAD2~ Subtype_mRNA)
+Final_Merged_DF |>
+  pairwise_wilcox_test(CMPK2~ Subtype_mRNA)
+
+```
+
+## More Advanced Vizualizations and Signficance Testing 
+CMPK2
+
+```{r}
+#it can also be used in plotting 
+ggplot(
+  data = Final_Merged_DF,
+  mapping = aes(x=as.factor(Subtype_mRNA),y=as.numeric(CMPK2),color= as.factor(Subtype_mRNA))
+) + 
+  geom_jitter() +
+  geom_boxplot() + 
+  ylim(0,5000) + 
+  labs(
+    title = "CMPK2 Gene Expression Across TCGA PAM50 Subtypes",
+    subtitle = "Wilcox test was used to compare Basal to the other subtypes",
+    x = "PAM50 Subtype", y = "Normalized CMPK2 Gene Expression",
+    color = "Subtype_mRNA"
+    ) + 
+  stat_pvalue_manual(Final_Merged_DF |>
+              pairwise_wilcox_test(CMPK2~ Subtype_mRNA) |>
+                  filter(group1 == "Basal") |>
+                      add_xy_position(), y.position = c(4000,4300,4600,4900)) 
+  #ggsave('~/Documents/BRCA_Gene_Expression/CMPK2_Basal_vs_PAM50_Boxplot_TCGA.pdf')
+
+```
+RSAD2
+
+```{r}
+#it can also be used in plotting 
+ggplot(
+  data = Final_Merged_DF,
+  mapping = aes(x=as.factor(Subtype_mRNA),y=as.numeric(RSAD2),color= as.factor(Subtype_mRNA))
+) + 
+  geom_jitter() +
+  geom_boxplot() + 
+  ylim(0,5000) + 
+  labs(
+    title = "RSAD2 Gene Expression Across TCGA PAM50 Subtypes",
+    subtitle = "Wilcox test was used to compare Basal to the other subtypes",
+    x = "PAM 50 Subtype", y = "Normalized RSAD2 Gene Expression",
+    color = "Subtype_mRNA"
+    ) + 
+  stat_pvalue_manual(Final_Merged_DF |>
+              pairwise_wilcox_test(RSAD2~ Subtype_mRNA) |>
+                  filter(group1 == "Basal") |>
+                      add_xy_position(), y.position = c(4000,4300,4600,4900))
+#ggsave('~/Documents/BRCA_Gene_Expression/RSAD2_Basal_vs_PAM50_Boxplot_TCGA.pdf')
+
+```
+As can be seen from the Wilcox test (non-parametric two group comparison) there are differences in expression between Basal and some of the other subtypes.
+
+### Two Group Comparison Basic Plots
+Basal vs Not Basal
+```{r}
+#could try wilcox or t test for two group comparison by making a variable isBasal
+Final_Merged_DF<- Final_Merged_DF |>
+  mutate(
+    isBasal = ifelse(Subtype_mRNA == 'Basal', "Basal","Not_Basal")
+  )
+
+```
+
+```{r}
+ggplot(
+  data = Final_Merged_DF,
+  mapping = aes(as.factor(isBasal),as.numeric(CMPK2))
+) +
+  geom_boxplot()
+
+
+ggplot(
+  data = Final_Merged_DF,
+  mapping = aes(as.factor(isBasal),as.numeric(RSAD2))
+) +
+  geom_boxplot()
+
+
+
+```
+
+```{r}
+wilcox.test(RSAD2 ~ isBasal, data = Final_Merged_DF)
+wilcox.test(CMPK2 ~ isBasal, data = Final_Merged_DF)
+
+
+
+```
+
+### Two Group Comparison Based on TNBC Status 
+TNBC Status
+
+```{r}
+#same idea but for TNBC status 
+Final_Merged_DF<- Final_Merged_DF |>
+  mutate(
+    isTNBC = ifelse(ERStatus == 'Negative' & PRStatus == 'Negative' & HER2Status == "Negative", "TNBC","Not_TNBC")
+  )
+
+
+head(Final_Merged_DF)
+
+
+```
+
+
+Example tests to make sure everything works as expected 
+```{r}
+wilcox.test(RSAD2 ~ isTNBC, data = Final_Merged_DF)
+wilcox.test(CMPK2 ~ isTNBC, data = Final_Merged_DF)
+
+
+
+```
+
+CMPK2 TNBC 
+
+```{r}
+#it can also be used in plotting 
+ggplot(
+  data = Final_Merged_DF,
+  mapping = aes(factor(isTNBC, levels = c('TNBC','Not_TNBC')),y=as.numeric(CMPK2),color= as.factor(isTNBC))
+) + 
+  geom_jitter() +
+  geom_boxplot() + 
+  ylim(0,5000) + 
+  labs(
+    title = "CMPK2 Gene Expression Across TCGA Patients",
+    subtitle = "Wilcox test was used used to compare TNBC to non-TNBC",
+    x = "TNBC Classification", y = "Normalized CMPK2 Gene Expression",
+    color = "TNBC Classification"
+    ) + 
+  stat_pvalue_manual(Final_Merged_DF |>
+              wilcox_test(CMPK2~ isTNBC) |>
+                      add_xy_position(), y.position = c(4000)) 
+  #ggsave('~/Documents/BRCA_Gene_Expression/CMPK2_TNBC_vs_NonTNBC_Boxplot_TCGA.pdf')
+
+```
+RSDA2
+
+
+```{r}
+#it can also be used in plotting 
+ggplot(
+  data = Final_Merged_DF,
+  mapping = aes(x= factor(isTNBC, levels = c('TNBC','Not_TNBC')),y=as.numeric(RSAD2),color= as.factor(isTNBC))
+) + 
+  geom_jitter() +
+  geom_boxplot() + 
+  ylim(0,5000) + 
+  labs(
+    title = "RSAD2 Gene Expression Across TCGA Patients",
+    subtitle = "Wilcox test was used to compare TNBC to non-TNBC",
+    x = "TNBC Classification", y = "Normalized RSAD2 Gene Expression",
+    color = "TNBC Classification"
+    ) + 
+  stat_pvalue_manual(Final_Merged_DF |>
+              wilcox_test(RSAD2~ isTNBC) |>
+                      add_xy_position(), y.position = c(4000)) 
+  #ggsave('~/Documents/BRCA_Gene_Expression/RSAD2_TNBC_vs_NonTNBC_Boxplot_TCGA.pdf')
+
+```
+
+
+```{r}
+#it can also be used in plotting 
+
+for(i in genesofinterest){
+  
+plt<- ggplot(
+  data = Final_Merged_DF,
+  mapping = aes(factor(isTNBC, levels = c('TNBC','Not_TNBC')),y=.data[[i]],color= as.factor(isTNBC))
+) + 
+  geom_jitter() +
+  geom_boxplot() + 
+  ylim(0,5000) + 
+  labs(
+    title = str_c("Gene Expression"," of ",i," Across TCGA Patients"),
+    subtitle = "Wilcox test was used used to compare TNBC to non-TNBC",
+    x = "TNBC Classification", y = str_c("Normalized Gene Expression"," of ",i),
+    color = "TNBC Classification"
+    )  + 
+  stat_compare_means(method = "wilcox") 
+#ggsave(str_c('~/Documents/BRCA_Gene_Expression/',i,'_TNBC_vs_NonTNBC_Boxplot_TCGA.pdf'))
+print(plt)
+
+}
+  #ggsave('~/Documents/BRCA_Gene_Expression/CMPK2_TNBC_vs_NonTNBC_Boxplot_TCGA.pdf')
+
+```
+```{r}
+sessionInfo()
+
+```
